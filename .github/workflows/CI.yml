@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  Prerequisites:
+    runs-on: ubuntu-latest
+    # steps 之间传递数据可以通过 ${{ steps.step1.outputs.test }}
+    # 而 jobs 之间传递则需要靠 ${{needs.job1.outputs.output1}}
+    # 具体见 https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#jobsjob_idoutputs
+    outputs:
+      flag: ${{ steps.get-paths.outputs.flag }}
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v2
+
+      # 本来根据 https://docs.github.com/en/developers/webhooks-and-events/webhook-events-and-payloads#push
+      # 和 https://docs.github.com/en/actions/reference/context-and-expression-syntax-for-github-actions#object-filters
+      # 在 PUSH 中可以通过 ${{ github.event.commits.*.added }} 来获取 added,modified,removed 文件
+      # 但是根据 https://github.blog/changelog/2019-10-16-changes-in-github-actions-push-event-payload/
+      # 这三个属性已经被删除了，所以只能用 https://docs.github.com/en/rest/reference/repos#compare-two-commits
+      - name: Get Paths
+        id: get-paths
+        uses: actions/github-script@v3
+        env:
+          repository: ${{ github.repository }} # The owner and repository name. For example, Codertocat/Hello-World.
+          before: ${{ github.event.before }}
+          after: ${{ github.event.after }}
+        # 根据 https://github.com/actions/github-script#download-data-from-a-url
+        # 用 github.request() 来下载，result.data 已解析为 JSON
+        # 注意 match 的用法：(.match() || [])[0]
+        # 用 indexOf() 实现数组去重
+        # 用 fs.existsSync() 判断文件是否存在
+        # 实测发现，可以直接用 require('fs')，但不能用 import
+        with:
+          script: |
+            const fs = require('fs')
+            const result = await github.request("https://api.github.com/repos/${{ env.repository }}/compare/${{ env.before }}...${{ env.after }}")
+            const paths = result.data.files
+              .map(x => (x['filename'].match(/part\d\/.+?(?=\/)/) || [])[0])
+              .filter(Boolean)
+              .filter((item, index, array) => array.indexOf(item) === index)
+              .filter(x => fs.existsSync(x))
+            core.setOutput('paths', paths)
+            core.setOutput('flag', paths.length ? 'true' : 'false')
+
+      - name: Set Matrix
+        id: set-matrix
+        uses: actions/github-script@v3
+        # 实测发现，当 flag 的值为布尔值 true 时，不能正常判断
+        # 所以需要将 flag 改为字符串 'true'，再去判断 flag == 'true'
+        if: ${{ steps.get-paths.outputs.flag == 'true' }}
+        with:
+          script: |
+            const matrix = {}
+            matrix.path = ${{ steps.get-paths.outputs.paths }}
+            core.setOutput('matrix', JSON.stringify(matrix))
+
+
+  Deploy:
+    runs-on: ubuntu-latest
+    needs: Prerequisites
+    if: ${{ needs.Prerequisites.outputs.flag == 'true' }}
+    # 来自 https://github.community/t/check-pushed-file-changes-with-git-diff-tree-in-github-actions/17220/10
+    strategy:
+      matrix: ${{ fromJson(needs.Prerequisites.outputs.matrix) }}
+
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v2
+
+      # 如果 README 不存在，自动创建；否则，跳过该 step
+      - name: Add README 📝
+        id: add-readme
+        uses: actions/github-script@v3
+        if: ${{ hashFiles(format('{0}/README.md', matrix.path)) == '' }}
+        with:
+          script: |
+            const fs = require('fs')
+            const readme = '${{ matrix.path }}/README.md'
+            const text = '# Preview\nhttps://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/${{ matrix.path }}'
+            fs.writeFileSync(readme, text)
+
+      # 根据 https://github.community/t/parameter-on-step-if-previous-skipped/18320/4
+      # 来判断条件：如果上一个 step 被跳过，则此 step 也跳过
+      # 否则的话自动发 commit https://github.com/marketplace/actions/add-commit
+      # 实测发现自动发 commit 并不会再次触发 Actions，导致死循环
+      - name: Auto Commit 📝
+        uses: EndBug/add-and-commit@v7
+        if: ${{ steps.add-readme.outcome != 'skipped' }}
+        with:
+          message: '📝 Auto add README'
+          add: '${{ matrix.path }}/README.md'
+
+      # 实测发现
+      # 不应该往 package.json 中添加 "homepage" : "part1/1.1"，这样会导致链接变为 https://arriv9l.github.io/part1/1.1/xxx，缺少了仓库名
+      # 也不应该设置 PUBLIC_URL=REPO_NAME/part1/1.1，这样会导致链接变为 https://arriv9l.github.io/REPO_NAME/part1/1.1/REPO_NAME/part1/1.1/xxx，重复了 REPO_NAME/part1/1.1
+      # 而应该设置 PUBLIC_URL=./，这样链接才能为正常格式的 https://arriv9l.github.io/REPO_NAME/part1/1.1/xxx
+      # 设置环境变量的教程见 https://create-react-app.dev/docs/adding-custom-environment-variables/#adding-temporary-environment-variables-in-your-shell
+      - name: Install and Build 🔧
+        run: |
+          cd ${{ matrix.path }}
+          yarn
+          PUBLIC_URL=./ yarn build
+
+      - name: Deploy 🚀
+        uses: JamesIves/github-pages-deploy-action@4.0.0
+        with:
+          branch: gh-pages
+          folder: ${{ matrix.path }}/build
+          target-folder: ${{ matrix.path }}
+          clean: false
