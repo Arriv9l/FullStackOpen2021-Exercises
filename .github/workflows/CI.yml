@@ -12,7 +12,7 @@ jobs:
     # 而 jobs 之间传递则需要靠 ${{needs.job1.outputs.output1}}
     # 具体见 https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#jobsjob_idoutputs
     outputs:
-      flag: ${{ steps.get-paths.outputs.flag }}
+      paths: ${{ steps.get-paths.outputs.paths }}
       matrix: ${{ steps.set-matrix.outputs.matrix }}
 
     steps:
@@ -31,12 +31,12 @@ jobs:
           repository: ${{ github.repository }} # The owner and repository name. For example, Codertocat/Hello-World.
           before: ${{ github.event.before }}
           after: ${{ github.event.after }}
-        # 根据 https://github.com/actions/github-script#download-data-from-a-url
+        # https://github.com/actions/github-script#download-data-from-a-url
         # 用 github.request() 来下载，result.data 已解析为 JSON
         # 注意 match 的用法：(.match() || [])[0]
         # 用 indexOf() 实现数组去重
         # 用 fs.existsSync() 判断文件是否存在
-        # 实测发现，可以直接用 require('fs')，但不能用 import
+        # 实测发现，可以直接用 require('fs')，但不能用 import，那是 TypeScript 的语法
         with:
           script: |
             const fs = require('fs')
@@ -47,14 +47,12 @@ jobs:
               .filter((item, index, array) => array.indexOf(item) === index)
               .filter(x => fs.existsSync(x))
             core.setOutput('paths', paths)
-            core.setOutput('flag', paths.length ? 'true' : 'false')
 
       - name: Set Matrix
         id: set-matrix
         uses: actions/github-script@v3
-        # 实测发现，当 flag 的值为布尔值 true 时，不能正常判断
-        # 所以需要将 flag 改为字符串 'true'，再去判断 flag == 'true'
-        if: ${{ steps.get-paths.outputs.flag == 'true' }}
+        # 判断数组是否为空，用 '[]'，加不加 join() 都可以
+        if: ${{ steps.get-paths.outputs.paths != '[]' }}
         with:
           script: |
             const matrix = {}
@@ -62,10 +60,46 @@ jobs:
             core.setOutput('matrix', JSON.stringify(matrix))
 
 
+  README:
+    runs-on: ubuntu-latest
+    needs: Prerequisites
+    if: ${{ needs.Prerequisites.outputs.paths != '[]' }}
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v2
+
+      # 自动创建所有缺失的 README
+      - name: Add README 📝
+        id: add-readme
+        uses: actions/github-script@v3
+        with:
+          script: |
+            const fs = require('fs')
+            const paths = ${{ needs.Prerequisites.outputs.paths }}.filter(path => !fs.existsSync(`${path}/README.md`))
+            const readmes = paths.map(path => {
+              const readme = `${path}/README.md`
+              const text = `# Preview\nhttps://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/${path}`
+              fs.writeFileSync(readme, text)
+              return readme
+            })
+            core.setOutput('readmes', readmes)
+
+      # https://github.com/marketplace/actions/add-commit
+      # 如果 readmes 数组不为空，则自动发 commit
+      # commit 中添加的文件为数组，就避免了一个文件一个 commit，有点刷绿墙的嫌疑
+      # 实测发现自动发 commit 并不会再次触发 Actions，导致死循环
+      - name: Auto Commit 📝
+        uses: EndBug/add-and-commit@v7
+        if: ${{ steps.add-readme.outputs.readmes != '[]' }}
+        with:
+          message: '📝 Auto Add README'
+          add: ${{ steps.add-readme.outputs.readmes }}
+
+
   Deploy:
     runs-on: ubuntu-latest
     needs: Prerequisites
-    if: ${{ needs.Prerequisites.outputs.flag == 'true' }}
+    if: ${{ needs.Prerequisites.outputs.paths != '[]' }}
     # 来自 https://github.community/t/check-pushed-file-changes-with-git-diff-tree-in-github-actions/17220/10
     strategy:
       matrix: ${{ fromJson(needs.Prerequisites.outputs.matrix) }}
@@ -73,29 +107,6 @@ jobs:
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v2
-
-      # 如果 README 不存在，自动创建；否则，跳过该 step
-      - name: Add README 📝
-        id: add-readme
-        uses: actions/github-script@v3
-        if: ${{ hashFiles(format('{0}/README.md', matrix.path)) == '' }}
-        with:
-          script: |
-            const fs = require('fs')
-            const readme = '${{ matrix.path }}/README.md'
-            const text = '# Preview\nhttps://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/${{ matrix.path }}'
-            fs.writeFileSync(readme, text)
-
-      # 根据 https://github.community/t/parameter-on-step-if-previous-skipped/18320/4
-      # 来判断条件：如果上一个 step 被跳过，则此 step 也跳过
-      # 否则的话自动发 commit https://github.com/marketplace/actions/add-commit
-      # 实测发现自动发 commit 并不会再次触发 Actions，导致死循环
-      - name: Auto Commit 📝
-        uses: EndBug/add-and-commit@v7
-        if: ${{ steps.add-readme.outcome != 'skipped' }}
-        with:
-          message: '📝 Auto add README'
-          add: '${{ matrix.path }}/README.md'
 
       # 实测发现
       # 不应该往 package.json 中添加 "homepage" : "part1/1.1"，这样会导致链接变为 https://arriv9l.github.io/part1/1.1/xxx，缺少了仓库名
