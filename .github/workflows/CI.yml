@@ -3,7 +3,13 @@ name: CI
 on:
   push:
     branches: [ main ]
+  # 由于 inputs 的 default 值不能引用 ${{ env.repository }}, ${{ github.repository }} 之类的变量
+  # 所以干脆不设，在 JS 代码中进行判定
   workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL To Debug'
+        required: true
 
 jobs:
   Prerequisites:
@@ -27,10 +33,6 @@ jobs:
       - name: Get Paths
         id: get-paths
         uses: actions/github-script@v3
-        env:
-          repository: ${{ github.repository }} # The owner and repository name. For example, Codertocat/Hello-World.
-          before: ${{ github.event.before }}
-          after: ${{ github.event.after }}
         # https://github.com/actions/github-script#download-data-from-a-url
         # 用 github.request() 来下载，result.data 已解析为 JSON
         # 注意 match 的用法：(.match() || [])[0]
@@ -40,7 +42,8 @@ jobs:
         with:
           script: |
             const fs = require('fs')
-            const result = await github.request("https://api.github.com/repos/${{ env.repository }}/compare/${{ env.before }}...${{ env.after }}")
+            const url = '${{ github.event.inputs.url }}' || 'https://api.github.com/repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.event.after }}'
+            const result = await github.request(url)
             const paths = result.data.files
               .map(x => (x['filename'].match(/part\d\/.+?(?=\/)/) || [])[0])
               .filter(Boolean)
@@ -102,8 +105,10 @@ jobs:
     needs: Prerequisites
     if: ${{ needs.Prerequisites.outputs.paths != '[]' }}
     # 来自 https://github.community/t/check-pushed-file-changes-with-git-diff-tree-in-github-actions/17220/10
+    # 用 max-parallel 来限制同时运行的作业的最大数目
     strategy:
       matrix: ${{ fromJson(needs.Prerequisites.outputs.matrix) }}
+      max-parallel: 3
 
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
