@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL To Debug'
+        description: 'URL to debug'
         required: true
 
 jobs:
@@ -18,7 +18,8 @@ jobs:
     # 而 jobs 之间传递则需要靠 ${{needs.job1.outputs.output1}}
     # 具体见 https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#jobsjob_idoutputs
     outputs:
-      paths: ${{ steps.get-paths.outputs.paths }}
+      heroku-paths: ${{ steps.get-paths.outputs.heroku-paths }}
+      pages-paths: ${{ steps.get-paths.outputs.pages-paths }}
       matrix: ${{ steps.set-matrix.outputs.matrix }}
 
     steps:
@@ -45,67 +46,35 @@ jobs:
             const url = '${{ github.event.inputs.url }}' || 'https://api.github.com/repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.event.after }}'
             const result = await github.request(url)
             const paths = result.data.files
-              .map(x => (x['filename'].match(/part\d\/.+?(?=\/)/) || [])[0])
-              .filter(Boolean)
-              .filter((item, index, array) => array.indexOf(item) === index)
-              .filter(x => fs.existsSync(x))
-            core.setOutput('paths', paths)
+                          .map(x => (x['filename'].match(/part\d\/.+?(?=\/)/) || [])[0])
+                          .filter(Boolean)
+                          .filter((item, index, array) => array.indexOf(item) === index)
+                          .filter(x => fs.existsSync(x))
+            const pagesPaths = paths.filter(path => !fs.existsSync(`${path}/Procfile`))
+            const herokuPaths = paths.filter(path => !pagesPaths.includes(path))
+                                     .filter(path => !fs.existsSync(`${path}/README.md`))
+                                     .filter(x => false)
+            core.setOutput('pages-paths', pagesPaths)
+            core.setOutput('heroku-paths', herokuPaths)
 
       - name: Set Matrix
         id: set-matrix
         uses: actions/github-script@v3
         # 判断数组是否为空，用 '[]'，加不加 join() 都可以
-        if: ${{ steps.get-paths.outputs.paths != '[]' }}
+        if: ${{ steps.get-paths.outputs.pages-paths != '[]' }}
         with:
           script: |
             const matrix = {}
-            matrix.path = ${{ steps.get-paths.outputs.paths }}
+            matrix.path = ${{ steps.get-paths.outputs.pages-paths }}
             core.setOutput('matrix', JSON.stringify(matrix))
-
-
-  README:
-    runs-on: ubuntu-latest
-    needs: Prerequisites
-    if: ${{ needs.Prerequisites.outputs.paths != '[]' }}
-    steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v2
-
-      # 自动创建所有缺失的 README
-      # 注意 github.io 的链接最后要加上 /
-      - name: Add README 📝
-        id: add-readme
-        uses: actions/github-script@v3
-        with:
-          script: |
-            const fs = require('fs')
-            const paths = ${{ needs.Prerequisites.outputs.paths }}.filter(path => !fs.existsSync(`${path}/README.md`))
-            const readmes = paths.map(path => {
-              const readme = `${path}/README.md`
-              const text = `# Preview\nhttps://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/${path}/`
-              fs.writeFileSync(readme, text)
-              return readme
-            })
-            core.setOutput('readmes', readmes)
-
-      # https://github.com/marketplace/actions/add-commit
-      # 如果 readmes 数组不为空，则自动发 commit
-      # commit 中添加的文件为数组，就避免了一个文件一个 commit，有点刷绿墙的嫌疑
-      # 实测发现自动发 commit 并不会再次触发 Actions，导致死循环
-      - name: Auto Commit 📝
-        uses: EndBug/add-and-commit@v7
-        if: ${{ steps.add-readme.outputs.readmes != '[]' }}
-        with:
-          message: '📝 Auto Add README'
-          add: ${{ steps.add-readme.outputs.readmes }}
 
 
   Build:
     runs-on: ubuntu-latest
     needs: Prerequisites
-    if: ${{ needs.Prerequisites.outputs.paths != '[]' }}
+    if: ${{ needs.Prerequisites.outputs.pages-paths != '[]' }}
     # 来自 https://github.community/t/check-pushed-file-changes-with-git-diff-tree-in-github-actions/17220/10
-    # 用 max-parallel 来限制同时运行的作业的最大数目
+    # 用 max-parallel 可以限制同时运行的作业的最大数目
     strategy:
       matrix: ${{ fromJson(needs.Prerequisites.outputs.matrix) }}
 
@@ -160,25 +129,24 @@ jobs:
           retention-days: 1
 
 
-  Deploy:
+  Deploy-Pages:
     runs-on: ubuntu-latest
     needs: [ Prerequisites, Build ]
-    if: ${{ needs.Prerequisites.outputs.paths != '[]' }}
+    if: ${{ needs.Prerequisites.outputs.pages-paths != '[]' }}
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v2
 
-      # https://github.com/actions/download-artifact#download-all-artifacts
       - name: Download all workflow run artifacts 📦
         uses: actions/download-artifact@v2
 
-      # 此处要注意在 {} 外面加上 ()
+      # 此处要注意在箭头函数的 {} 外面加上 ()
       - name: setFolderMap
         id: set-folderMap
         uses: actions/github-script@v3
         with:
           script: |
-            const paths = ${{ needs.Prerequisites.outputs.paths }}
+            const paths = ${{ needs.Prerequisites.outputs.pages-paths }}
             const folderMap = paths.map(path => ({
               folder: `${path}/build`.replace(/\//g, '-'),
               targetFolder: path,
@@ -194,3 +162,87 @@ jobs:
           branch: gh-pages
           folder: ${{ steps.set-folderMap.outputs.folder }}
           folder-map: ${{ steps.set-folderMap.outputs.folderMap }}
+
+
+  Deploy-Heroku:
+    runs-on: ubuntu-latest
+    needs: Prerequisites
+    if: ${{ needs.Prerequisites.outputs.heroku-paths != '[]' }}
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v2
+
+      # https://github.com/Atrox/haikunatorjs
+      # 没有当前路径下没有 package.json，所以必须以 require('./node_modules/xxx') 的方式导入模块
+      # 哪怕用 npm install -g 的方式全局安装，也不能用 require('xxx')
+      # BTW，如果要想用 -g 全局安装，必须加上 actions/setup-node@v2
+      # Also，本来以为多行代码要在末尾用 \ 反斜杠的，实测发现可用可不用
+      # Lastly，根据 https://nodejs.org/api/cli.html#cli_e_eval_script，
+      # 在 Windows node -e '' 单引号并不起作用，所以最好统一用 "" 双引号
+      - name: Get Heroku-like Random Name
+        id: get-name
+        run: |
+          npm install haikunator
+          name=$(node -e "const Haikunator = require('./node_modules/haikunator')
+                          const haikunator = new Haikunator()
+                          const name = haikunator.haikunate()
+                          console.log(name)")
+          echo "::set-output name=name::$name"
+
+      # 由于必须要先用 heroku create 来”注册“一个 HEROKU_APP_NAME，
+      # 直接生成后 git push 的话是不允许的，会报错 'No such app as HEROKU_APP_NAME'
+      # 难怪网上关于取一个 unique 的 HEROKU_APP_NAME 的资料那么少
+      - name: Deploy to Heroku
+        if: false
+        env:
+          HEROKU_API_TOKEN: ${{ secrets.HEROKU_API_TOKEN }}
+          HEROKU_APP_NAME: ${{ steps.get-name.outputs.name }}
+        run: |
+          git remote add heroku https://heroku:$HEROKU_API_TOKEN@git.heroku.com/damp-plateau-93441.git
+          git subtree push --prefix part3/3.1 heroku test
+
+
+  README:
+    runs-on: ubuntu-latest
+    # 很尴尬，needs 不能二选一，既然 always() 可以，为啥我的 if 条件表达式就不行？？？
+    # 无奈我只能先去掉 Deploy-Heroku
+    needs: [ Prerequisites, Deploy-Pages ]
+    if: ${{ needs.Prerequisites.outputs.pages-paths != '[]' || needs.Prerequisites.outputs.heroku-paths != '[]' }}
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v2
+
+      # 自动创建所有缺失的 README
+      - name: Add README 📝
+        id: add-readme
+        uses: actions/github-script@v3
+        with:
+          script: |
+            const fs = require('fs')
+            const paths = [
+              ...${{ needs.Prerequisites.outputs.heroku-paths }},
+              ...${{ needs.Prerequisites.outputs.pages-paths }}.filter(path => !fs.existsSync(`${path}/README.md`))
+            ]
+            const readmes = paths.map(path => {
+              const readme = `${path}/README.md`
+              let text
+              if (!fs.existsSync(`${path}/Procfile`)) {
+                text = `# Preview\nhttps://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/${path}`
+              } else {
+                text = `https://$HEROKU_APP_NAME.herokuapp.com/`
+              }
+              fs.writeFileSync(readme, text)
+              return readme
+            })
+            core.setOutput('readmes', readmes)
+
+      # https://github.com/marketplace/actions/add-commit
+      # 如果 readmes 数组不为空，则自动发 commit
+      # commit 中添加的文件为数组，就避免了一个文件一个 commit，有点刷绿墙的嫌疑
+      # 实测发现自动发 commit 并不会再次触发 Actions，导致死循环
+      - name: Auto Commit 📝
+        uses: EndBug/add-and-commit@v7
+        if: ${{ steps.add-readme.outputs.readmes != '[]' }}
+        with:
+          message: '📝 Auto Add README'
+          add: ${{ steps.add-readme.outputs.readmes }}
